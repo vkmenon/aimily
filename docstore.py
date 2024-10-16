@@ -117,6 +117,52 @@ class Page:
         """
         return json.dumps(self.to_dict())
 
+    @classmethod
+    def from_json(cls, json_path: str) -> 'Page':
+        """
+        Create a Page object from a JSON file.
+
+        Args:
+        json_path (str): The path to the JSON file.
+
+        Returns:
+        Page: A Page object created from the JSON file.
+        """
+        with open(json_path, 'r') as f:
+            data = json.load(f)
+        
+        
+
+        required_fields = ['raw_text', 'page_number', 'title']
+        for field in required_fields:
+            if field not in data:
+                raise ValueError(f"Missing required field: {field}")
+            
+        data_dd = defaultdict(str)
+        data_dd.update(data)
+
+        page = cls(
+            text=data_dd['raw_text'],
+            page_number=data_dd['page_number'],
+            title=data_dd['title'],
+            file_path=data_dd['file_path']
+        )
+        page.cleaned_text = data.get('cleaned_text')
+        page.tables = data.get('tables', [])
+        page.embed_text = data.get('embed_text')
+        
+        return page
+
+    def __str__(self) -> str:
+        if self.embed_text:
+            return self.embed_text
+        else:
+            self.finalize()
+            return self.embed_text
+    
+    def __repr__(self) -> str:
+        return f"Page(Document Title: {self.title}, Page Number: {self.page_number})"
+
 class Document:
     """
     A class representing a PDF document that contains multiple pages. The Document class handles 
@@ -135,7 +181,7 @@ class Document:
     _read_pages(): Reads the PDF and creates Page objects for each page.
     _clean_pages(): Cleans the pages by removing common artifacts such as headers and footers.
     """
-    
+
     def __init__(self, file_path: str, title: str, situate_context: bool = False) -> None:
         self.title = title
         self.file_path = file_path
