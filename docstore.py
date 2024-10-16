@@ -19,45 +19,29 @@ import boto3
 from urllib.parse import urlparse
 import tempfile
 
-def worker_finalize_page(page):
-    try:
-        return page.finalize()
-    except Exception as e:
-        print(f"Error processing page: {e}")
-        return None
-
-def overlap_score(str1: str, str2: str) -> float:
-    """
-    Calculate the score of the longest common substring between two strings relative to the length of the shorter string.
-    
-    Args:
-    str1 (str): The first string to compare.
-    str2 (str): The second string to compare.
-    
-    Returns:
-    float: The overlap score, which is the length of the longest common substring divided by the length of the shorter string.
-    """
-    if not str1 or not str2:
-        return 0.0
-    def longest_common_substring(s1, s2):
-        m, n = len(s1), len(s2)
-        dp = [[0] * (n + 1) for _ in range(m + 1)]
-        max_length = 0
-        
-        for i in range(1, m + 1):
-            for j in range(1, n + 1):
-                if s1[i - 1] == s2[j - 1]:
-                    dp[i][j] = dp[i - 1][j - 1] + 1
-                    max_length = max(max_length, dp[i][j])
-        
-        return max_length
-    
-    longest_overlap = longest_common_substring(str1, str2)
-    min_length = min(len(str1), len(str2))
-    
-    return longest_overlap / min_length
 
 class Page:
+    """
+    A class representing a single page in a document. The Page class handles the text content, metadata, and 
+    table extraction for a specific page in a PDF document.
+
+    Attributes:
+    raw_text (str): The raw text content of the page.
+    page_number (Union[int, List[int]]): The page number(s) of the PDF.
+    title (str): The title of the document the page belongs to.
+    file_path (str): The file path of the PDF document.
+    situated_text (str): Contextually processed text, with surrounding content for semantic analysis.
+    cleaned_text (str): Cleaned version of the raw text with common artifacts removed.
+    tables (List[str]): A list of tables extracted from the page, represented as strings.
+    embed_text (str): Final structured and formatted text of the page, including tables, headers, and footers.
+    
+    Methods:
+    _get_tables(): Extracts tables from the PDF page using Camelot.
+    finalize(): Finalizes the page content by combining text, tables, headers, and footers.
+    to_dict(): Converts the page's attributes to a dictionary.
+    to_json(): Converts the page's attributes to a JSON string.
+    """
+
     def __init__(self, text: str, page_number: Union[int, List[int]], title: str, file_path: str) -> None:
         self.raw_text = text
         self.page_number = page_number
@@ -80,10 +64,9 @@ class Page:
         Finalizes the text content of the page by incorporating tables, headers, and footers into the main text. 
         This method also extracts tables if they have not been extracted yet, and ensures that the final 
         embedded text for the page is structured and formatted appropriately.
-
-        This method constructs a full page text with headers indicating the start and end of the document, 
-        and any tables within the page enclosed in table-specific headers and footers. If the cleaned text 
-        or situated text has not been prepared, it defaults to using the raw text.
+        
+        Returns:
+        self: The Page object after finalization.
         """
         print(f'finalizing page {self.page_number}')
         header = f'<<<DOCUMENT : {self.title}, START PAGE : {self.page_number}>>>\n\n\n'
@@ -135,6 +118,24 @@ class Page:
         return json.dumps(self.to_dict())
 
 class Document:
+    """
+    A class representing a PDF document that contains multiple pages. The Document class handles 
+    reading, cleaning, and processing the pages in a PDF file, and optionally situating the context for semantic searches.
+
+    Attributes:
+    title (str): The title of the document.
+    file_path (str): The file path of the PDF document.
+    pages (List[Page]): A list of Page objects representing the pages in the document.
+    rechunked_pages (List[Page]): A list of rechunked pages if the document has been split into chunks.
+    
+    Methods:
+    finalize(n_jobs: int): Uses multiprocessing to finalize all pages in the document.
+    rechunk_pages(num_pages: int, overlap: int): Splits the document into chunks based on a specified number of pages per chunk.
+    situate_context(): Situates contextual information for each page in the document to assist with semantic search.
+    _read_pages(): Reads the PDF and creates Page objects for each page.
+    _clean_pages(): Cleans the pages by removing common artifacts such as headers and footers.
+    """
+    
     def __init__(self, file_path: str, title: str, situate_context: bool = False) -> None:
         self.title = title
         self.file_path = file_path
@@ -154,7 +155,12 @@ class Document:
             self.situate_context()
         
     def finalize(self, n_jobs: int = 1) -> None:
-        """Use multiprocessing to finalize the pages by extracting tables and formatting text."""
+        """
+        Use multiprocessing to finalize the pages by extracting tables and formatting text.
+        
+        Args:
+        n_jobs (int): Number of parallel jobs to run for multiprocessing.
+        """
 
         if isinstance(n_jobs, int) and n_jobs > 1:
             n_jobs = min(n_jobs, os.cpu_count())
@@ -232,10 +238,6 @@ class Document:
                         continue
 
                     for line2 in tokenized_pages[page_j]:
-
-                        if line1.startswith('<<'):
-                            continue
-
                         if SequenceMatcher(None, line1, line2).ratio() > 0.9:
                             if line1 in common_lines:
                                 common_lines[line1] += 1
@@ -264,6 +266,31 @@ class Document:
     
 
 class DocStore:
+    """
+    A class representing a document store that allows for the storage, retrieval, and searching of PDF documents. 
+    The DocStore supports adding documents, removing them, and performing hybrid search queries using BM25 and semantic embeddings.
+
+    Attributes:
+    store (dict): A dictionary storing page embeddings and their corresponding indices in the page_store.
+    title_index (defaultdict): A dictionary mapping document titles to their page indices in the page_store.
+    page_store (List[Page]): A list storing Page objects compactly.
+    path (str): The file path or S3 path where the store is saved.
+    semantic_weight (float): The weight assigned to semantic search results in the hybrid search.
+    bm25_weight (float): The weight assigned to BM25 search results in the hybrid search.
+    njobs (int): The number of parallel jobs for processing.
+    model (SentenceTransformer): The SentenceTransformer model used for generating semantic embeddings.
+    
+    Methods:
+    add_document(document: Document): Adds a document to the store, finalizing its pages and saving it.
+    remove_document(document_title: str): Removes a document and its pages from the store.
+    list_documents(): Returns a list of document titles stored in the database.
+    hybrid_search(query, top_k: int): Performs a hybrid search using BM25 and semantic search.
+    bm25_search(query: str, top_k: int): Performs a BM25 search and returns the top-k matching pages.
+    semantic_search(query: str, top_k: int): Performs a semantic vector search and returns the top-k matching pages.
+    save(): Saves the document store to a file or S3.
+    _compact_page_store(): Removes None entries from the page_store to keep it compact.
+    _load(file_path: str): Loads the document store from a file or S3.
+    """
 
     def __init__(self, path: str = None, semantic_weight: float = 0.75, bm25_weight: float = 0.25, njobs: int = None) -> None:
         self.store = {}  # Stores only embeddings and their indices in page_store
@@ -304,6 +331,9 @@ class DocStore:
     def add_document(self, document: Document) -> None:
         """
         Adds a document to the database, storing its pages in a compact format.
+        
+        Args:
+        document (Document): The document to add to the database.
         """
         print(f'START FINALIZE document: {document.title}')
         document.finalize(self.njobs)
@@ -320,6 +350,9 @@ class DocStore:
     def remove_document(self, document_title: str) -> None:
         """
         Completely removes a document and its pages from the database.
+        
+        Args:
+        document_title (str): The title of the document to remove.
         """
         page_indices = self.title_index.pop(document_title, [])
         for page_index in page_indices:
@@ -338,10 +371,23 @@ class DocStore:
     def list_documents(self) -> List[str]:
         """
         Lists all documents in the database.
+        
+        Returns:
+        List[str]: A list of document titles stored in the database.
         """
         return list(self.title_index.keys())
     
     def hybrid_search(self, query, top_k=5):
+        """
+        Perform a hybrid search using BM25 and semantic search, and return the top results.
+        
+        Args:
+        query (str): The search query.
+        top_k (int): The number of top results to return.
+
+        Returns:
+        List[Page]: A list of top-k pages matching the search query.
+        """
         vector_results = [((top_k*10)-rank,txt) for rank,txt in enumerate(self.semantic_search(query, top_k*10))]
         bm25_results = [((top_k*10)-rank,txt) for rank,txt in enumerate(self.bm25_search(query, top_k*10))]
 
@@ -371,6 +417,13 @@ class DocStore:
     def bm25_search(self, query: str, top_k: int = 10) -> List[dict]:
         """
         Perform a BM25 search over the stored documents' pages and return the top results.
+        
+        Args:
+        query (str): The search query.
+        top_k (int): The number of top results to return.
+        
+        Returns:
+        List[int]: The top-k page indices from the BM25 search.
         """
         valid_pages = [page for page in self.page_store if page is not None]
         tokenized_corpus = [page.embed_text.split(" ") for page in valid_pages]
@@ -382,7 +435,14 @@ class DocStore:
 
     def semantic_search(self, query: str, top_k: int = 10) -> List[dict]:
         """
-        Searches the database for similar vectors to the query.
+        Perform a semantic vector-based search over the stored documents' pages and return the top results.
+        
+        Args:
+        query (str): The search query.
+        top_k (int): The number of top results to return.
+        
+        Returns:
+        List[int]: The top-k page indices from the BM25 search.
         """
         query_emb = self.model.encode(query, prompt_name='s2p_query')
         doc_embeddings = [np.array(k).flatten() for k in self.store.keys() if self.page_store[self.store[k]] is not None]
@@ -434,6 +494,9 @@ class DocStore:
     def _load(self, file_path: str) -> None:
         """
         Loads the database from a file. Supports loading from local file system or S3.
+        
+        Args:
+        file_path (str): The path to the database file to load.
         """
         parsed_url = urlparse(file_path)
         if parsed_url.scheme == 's3':
@@ -449,3 +512,61 @@ class DocStore:
         else:
             with open(file_path, 'rb') as f:
                 self.store, self.title_index, self.page_store = pickle.load(f)
+
+def worker_finalize_page(page) -> Page:
+    """
+    Finalizes a single page by calling the page's finalize method and handling any exceptions.
+    
+    Args:
+    page: A Page object to finalize.
+
+    Returns:
+    The finalized page, or None if an error occurs.
+    """
+    try:
+        return page.finalize()
+    except Exception as e:
+        print(f"Error processing page: {e}")
+        return None
+
+def longest_common_substring(s1, s2):
+    """
+    Find the longest common substring between two strings using dynamic programming.
+    
+    Args:
+    s1: The first string.
+    s2: The second string.
+    
+    Returns:
+    int: The length of the longest common substring.
+    """
+    m, n = len(s1), len(s2)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    max_length = 0
+    
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if s1[i - 1] == s2[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1] + 1
+                max_length = max(max_length, dp[i][j])
+    
+    return max_length
+
+def overlap_score(str1: str, str2: str) -> float:
+    """
+    Calculate the score of the longest common substring between two strings relative to the length of the shorter string.
+    
+    Args:
+    str1 (str): The first string to compare.
+    str2 (str): The second string to compare.
+    
+    Returns:
+    float: The overlap score, which is the length of the longest common substring divided by the length of the shorter string.
+    """
+    if not str1 or not str2:
+        return 0.0
+        
+    longest_overlap = longest_common_substring(str1, str2)
+    min_length = min(len(str1), len(str2))
+    
+    return longest_overlap / min_length
