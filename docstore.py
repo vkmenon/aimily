@@ -19,6 +19,13 @@ import boto3
 from urllib.parse import urlparse
 import tempfile
 
+def worker_finalize_page(page):
+    try:
+        return page.finalize()
+    except Exception as e:
+        print(f"Error processing page: {e}")
+        return None
+
 def overlap_score(str1: str, str2: str) -> float:
     """
     Calculate the score of the longest common substring between two strings relative to the length of the shorter string.
@@ -65,7 +72,7 @@ class Page:
         """
         Extracts tables from the PDF page using Camelot and converts them to string format.
         """
-        for table in camelot.read_pdf(self.file_path, pages=str(self.page_number+1)):
+        for table in camelot.read_pdf(self.file_path, pages=str(self.page_number)):
             self.tables.append(table.df.to_string())
 
     def finalize(self) -> None:
@@ -78,10 +85,14 @@ class Page:
         and any tables within the page enclosed in table-specific headers and footers. If the cleaned text 
         or situated text has not been prepared, it defaults to using the raw text.
         """
+        print(f'finalizing page {self.page_number}')
         header = f'<<<DOCUMENT : {self.title}, START PAGE : {self.page_number}>>>\n\n\n'
         footer = f'\n\n\n<<<DOCUMENT : {self.title}, END PAGE : {self.page_number}>>>'
-        table_header = lambda i : f'\n\n<<START TABLE : {i}>>\n\n'
-        table_footer = lambda i : f'\n\n<<END TABLE : {i}>>\n\n'
+
+        def table_header(i):
+            return f'\n\n<<START TABLE : {i}>>\n\n'
+        def table_footer(i):
+            return f'\n\n<<END TABLE : {i}>>\n\n'
 
         if not self.tables:
             self._get_tables()
@@ -95,6 +106,8 @@ class Page:
             content = self.cleaned_text
 
         self.embed_text = header + content + table_text + footer
+
+        return self
 
     def to_dict(self) -> dict:
         """
@@ -140,20 +153,20 @@ class Document:
         if situate_context:
             self.situate_context()
         
-    def finalize(self, n_jobs: int) -> None:
+    def finalize(self, n_jobs: int = 1) -> None:
         """Use multiprocessing to finalize the pages by extracting tables and formatting text."""
+
+        if isinstance(n_jobs, int) and n_jobs > 1:
+            n_jobs = min(n_jobs, os.cpu_count())
+        else:
+            n_jobs = 1
+        print("Starting multiprocessing with", n_jobs, "jobs.")
         with Pool(n_jobs) as pool:
-            # List to hold the result of asynchronous operations
-            results = []
-
-            # Asynchronously apply finalize to each page
-            for page in self.pages:
-                result = pool.apply_async(page.finalize)
-                results.append(result)
-
-            # Ensure all asynchronous operations are completed
-            for result in results:
-                result.wait()
+            # Using a wrapper function for better error handling
+            results = pool.map(worker_finalize_page, self.pages)
+        self.pages = [result for result in results if result is not None]
+        self.pages.sort(key=lambda x: x.page_number)
+        print("Completed multiprocessing.")
 
     def rechunk_pages(self, num_pages: int, overlap: int) -> None:
         """
@@ -237,7 +250,7 @@ class Document:
         # Remove lines from page_chunks that are similar to common_lines
         for page in self.pages:
             new_page = []
-            for line in page.split('\n'):
+            for line in page.raw_text.split('\n'):
                 
                 similarity = any(SequenceMatcher(None, line.strip(), common_line.strip()).ratio() > 0.90 for common_line in common_lines)
                 subset = any(line.strip() in common_line.strip() or common_line.strip() in line.strip() for common_line in common_lines)
@@ -252,13 +265,22 @@ class Document:
 
 class DocStore:
 
-    def __init__(self, model: Any, path: str = None) -> None:
+    def __init__(self, path: str = None, semantic_weight: float = 0.75, bm25_weight: float = 0.25, njobs: int = None) -> None:
         self.store = {}  # Stores only embeddings and their indices in page_store
         self.title_index = defaultdict(list)  # Maps document titles to indices in page_store
         self.page_store = []  # Compact store for page objects
-        self.model = model
         self.path = path
-  
+        self.semantic_weight = semantic_weight
+        self.bm25_weight = bm25_weight
+        self.njobs = njobs
+        self.model = SentenceTransformer(
+            "dunzhang/stella_en_400M_v5",
+            trust_remote_code=True,
+            device="cpu",
+            config_kwargs={"use_memory_efficient_attention": False, "unpad_inputs": False}
+        )
+
+
         if path is not None:
             parsed_url = urlparse(path)
             if parsed_url.scheme == 's3':
@@ -273,7 +295,7 @@ class DocStore:
                     s3.put_object(Bucket=bucket, Key=key)
             else:
                 if os.path.exists(path):
-                    self.load(path)
+                    self._load(path)
                 else:
                     os.makedirs(os.path.dirname(path), exist_ok=True)
                     with open(path, 'wb') as f:
@@ -283,6 +305,9 @@ class DocStore:
         """
         Adds a document to the database, storing its pages in a compact format.
         """
+        print(f'START FINALIZE document: {document.title}')
+        document.finalize(self.njobs)
+        print(f'END FINALIZE document: {document.title}')
         for page in document.pages:
             embedding = tuple(self.model.encode(page.embed_text))
             page_index = len(self.page_store)
@@ -290,7 +315,7 @@ class DocStore:
             self.store[embedding] = page_index
             self.title_index[document.title].append(page_index)
         
-        self.save("docstore.pkl")
+        self.save()
 
     def remove_document(self, document_title: str) -> None:
         """
@@ -316,6 +341,33 @@ class DocStore:
         """
         return list(self.title_index.keys())
     
+    def hybrid_search(self, query, top_k=5):
+        vector_results = [((top_k*10)-rank,txt) for rank,txt in enumerate(self.semantic_search(query, top_k*10))]
+        bm25_results = [((top_k*10)-rank,txt) for rank,txt in enumerate(self.bm25_search(query, top_k*10))]
+
+        # Create a dictionary to store combined scores
+        combined_scores = {}
+
+        # Add BM25 results to the combined scores
+        for score, doc in bm25_results:
+            if doc in combined_scores:
+                combined_scores[doc] += score * self.bm25_weight
+            else:
+                combined_scores[doc] = score * self.bm25_weight
+
+        # Add vector search results to the combined scores
+        for score, doc in vector_results:
+            if doc in combined_scores:
+                combined_scores[doc] += score * self.semantic_weight
+            else:
+                combined_scores[doc] = score * self.semantic_weight
+
+        # Sort the combined results based on the combined scores
+        combined_results = sorted(combined_scores.items(), key=lambda x: x[1], reverse=True)
+
+        # Extract the top_k results
+        return [self.page_store[c[0]] for c in combined_results[:top_k]]
+
     def bm25_search(self, query: str, top_k: int = 10) -> List[dict]:
         """
         Perform a BM25 search over the stored documents' pages and return the top results.
@@ -326,19 +378,38 @@ class DocStore:
         query_tokens = query.split(" ")
         scores = bm25.get_scores(query_tokens)
         top_indices = np.argsort(scores)[::-1][:top_k]
-        return [valid_pages[i].to_dict() for i in top_indices]
+        return top_indices
 
     def semantic_search(self, query: str, top_k: int = 10) -> List[dict]:
         """
         Searches the database for similar vectors to the query.
         """
-        query_emb = self.model.encode(query)
-        valid_indices = [index for index in self.store.values() if self.page_store[index] is not None]
-        doc_embeddings = [self.page_store[index].embed_text for index in valid_indices]
-        similarities = [self.model.similarity(query_emb, emb) for emb in doc_embeddings]
-        top_indices = np.argsort(similarities)[::-1][:top_k]
-        return [self.page_store[index].to_dict() for index in top_indices[:top_k]]
-    
+        query_emb = self.model.encode(query, prompt_name='s2p_query')
+        doc_embeddings = [np.array(k).flatten() for k in self.store.keys() if self.page_store[self.store[k]] is not None]
+        similarities = self.model.similarity(query_emb, doc_embeddings)
+        top_indices = np.argsort(list(similarities.flatten()))[::-1][:top_k]
+        return top_indices
+        
+    def save(self) -> None:
+        """
+        Saves the database to a file, including the page_store for BM25.
+        Supports saving to local file system or S3.
+        """
+        parsed_url = urlparse(self.path)
+        if parsed_url.scheme == 's3':
+            s3 = boto3.client('s3')
+            bucket = parsed_url.netloc
+            key = parsed_url.path.lstrip('/')
+            with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                temp_file_name = temp_file.name
+                pickle.dump((self.store, self.title_index, self.page_store), temp_file)
+            with open(temp_file_name, 'rb') as f:
+                s3.upload_fileobj(f, bucket, key)
+            os.remove(temp_file_name)
+        else:
+            with open(self.path, 'wb') as f:
+                pickle.dump((self.store, self.title_index, self.page_store), f)
+
     def _compact_page_store(self):
         """
         Removes None entries from page_store to keep it compact.
@@ -358,8 +429,9 @@ class DocStore:
                 del self.store[k]
 
         self.page_store = new_page_store
-    
-    def load(self, file_path: str) -> None:
+
+
+    def _load(self, file_path: str) -> None:
         """
         Loads the database from a file. Supports loading from local file system or S3.
         """
@@ -377,23 +449,3 @@ class DocStore:
         else:
             with open(file_path, 'rb') as f:
                 self.store, self.title_index, self.page_store = pickle.load(f)
-
-    def save(self, file_path: str) -> None:
-        """
-        Saves the database to a file, including the page_store for BM25.
-        Supports saving to local file system or S3.
-        """
-        parsed_url = urlparse(file_path)
-        if parsed_url.scheme == 's3':
-            s3 = boto3.client('s3')
-            bucket = parsed_url.netloc
-            key = parsed_url.path.lstrip('/')
-            with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-                temp_file_name = temp_file.name
-                pickle.dump((self.store, self.title_index, self.page_store), temp_file)
-            with open(temp_file_name, 'rb') as f:
-                s3.upload_fileobj(f, bucket, key)
-            os.remove(temp_file_name)
-        else:
-            with open(file_path, 'wb') as f:
-                pickle.dump((self.store, self.title_index, self.page_store), f)
