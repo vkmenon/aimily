@@ -1,8 +1,10 @@
 import json
-import random
 import os
 import pickle
+import random
+import tempfile
 
+import boto3
 import camelot
 
 import numpy as np
@@ -17,7 +19,6 @@ from sentence_transformers import SentenceTransformer
 from typing import Any, List, Union
 import boto3
 from urllib.parse import urlparse
-import tempfile
 
 
 class Page:
