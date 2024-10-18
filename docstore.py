@@ -560,7 +560,7 @@ class DocStore:
             with open(file_path, 'rb') as f:
                 self.store, self.title_index, self.page_store = pickle.load(f)
 
-def worker_finalize_page(page) -> Page:
+def worker_finalize_page(page: Page) -> Page:
     """
     Finalizes a single page by calling the page's finalize method and handling any exceptions.
     
@@ -576,7 +576,7 @@ def worker_finalize_page(page) -> Page:
         print(f"Error processing page: {e}")
         return None
 
-def longest_common_substring(s1, s2):
+def longest_common_substring(s1: str, s2: str):
     """
     Find the longest common substring between two strings using dynamic programming.
     
