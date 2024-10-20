@@ -333,6 +333,16 @@ How many people are in management across the companies? What is the male and fem
 
 '''
 
+CHAT_SYSTEM_PROMPT = """
+You are a helpful AI assistant that can answer questions about the documents uploaded by the user. You can help the user by providing information about the documents, answering questions about the content of the documents, and providing insights based on the information in the documents.
+
+You will be provided with a Context (delimited with [[CONTEXT]] and [[END CONTEXT]]), that can contain Pages (delimited with <<<START PAGE : N >>> and <<<END PAGE : N>>>) and Tables (delimited with <<START TABLE : N>> and <<END TABLE : N>>).
+
+You will also be provided with a question (delimited with [[QUESTION]]), that will ask you to extract specific information from the Context.
+
+Your task is to extract the information requested in the question from the Context.
+"""
+
 DOCUMENT_CONTEXT_PROMPT = """
 <document>
 {doc_content}
@@ -378,6 +388,43 @@ def get_answer(context,question):
     )
 
     return json.loads(response.choices[0].message.content)
+
+def get_answer_chat(context,question,prev_messages=None):
+    if prev_messages is None:
+        prev_messages = []
+
+    client = OpenAI(
+        api_key=os.getenv("OPENAI_API_KEY"),
+        organization=os.getenv("OPENAI_ORG_ID")
+    )
+
+    gpt_prompt = f'[[CONTEXT]]\n\n{context}\n\n[[END CONTEXT]]\n\n[[QUESTION]]\n\n{question}\n\n[[ANSWER]]\n\n'
+
+    messages = [
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": CHAT_SYSTEM_PROMPT},
+                ],
+            }
+    ]
+
+    messages.extend(prev_messages)
+    final_message = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": gpt_prompt},
+        ],
+    }
+    messages.append(final_message)
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0,
+        messages=messages
+    )
+    return response.choices[0].message.content
+
 
 def situate_context(doc: str, chunk: str) -> str:
     client = OpenAI(

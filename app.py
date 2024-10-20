@@ -1,14 +1,12 @@
 import hashlib
 import json
 import os
-import pickle
 import shutil
 
-import numpy as np
 import pandas as pd
 import streamlit as st
 
-from ai import get_answer
+from ai import get_answer, get_answer_chat
 from docstore import Document, DocStore
 
 PROJECTS_DIR = os.path.expanduser("~/esg/projects")
@@ -166,6 +164,41 @@ elif action == "Select Existing Project":
                     )
                 else:
                     st.error("Failed to generate report.")
+            
+            st.subheader("Ask questions about your Project Files")
+            st.button("Clear Chat History", on_click=lambda: st.session_state.pop("messages", None))
+            create_msg = lambda role,prompt : {"role": role, "content": prompt}
+            convert_messages = lambda messages : [{"role": msg["role"],"content": [{"type": "text", "text": msg["content"]}]} for msg in messages]
+            
+            # Initialize chat history
+            if "messages" not in st.session_state:
+                st.session_state.messages = []
+
+            # Display chat messages from history on app rerun
+            for message in st.session_state.messages:
+                with st.chat_message(message["role"]):
+                    st.markdown(message["content"])
+
+
+            # React to user input
+            if prompt := st.chat_input("Start chatting!"):
+                # Display user message in chat message container
+                st.chat_message("user").markdown(prompt)
+                # Add user message to chat history
+                usr_msg = create_msg("user",prompt)
+
+                page_results = docstore.hybrid_search(prompt)
+                context = '\n'.join([prompt.embed_text for prompt in page_results])
+                response = get_answer_chat(context,prompt,convert_messages(st.session_state.messages))
+
+                # Display assistant response in chat message container
+                with st.chat_message("assistant"):
+                    st.markdown(response)
+                # Add assistant response to chat history
+                assistant_msg = create_msg("assistant",response)
+
+                st.session_state.messages.append(usr_msg)
+                st.session_state.messages.append(assistant_msg)
     else:
         st.warning("No projects found.")
 
